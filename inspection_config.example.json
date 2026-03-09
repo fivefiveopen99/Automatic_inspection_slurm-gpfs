@@ -1,0 +1,21 @@
+{
+  "ssh_user": "root",
+  "sync_user": "root",
+  "timeout_sec": 5,
+  "time_sync_threshold_sec": 30,
+  "max_workers": 10,
+  "ib_port": 1,
+  "nodes": [
+    {
+      "host": "10.0.0.11",
+      "user": "root",
+      "slurm_node": "compute001",
+      "sync_user": "testuser",
+      "ib_port": 1
+    },
+    {
+      "host": "10.0.0.12",
+      "slurm_node": "compute002"
+    }
+  ]
+}
