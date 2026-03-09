@@ -1,0 +1,11 @@
+{
+  "ssh_user": "root",
+  "sync_user": "root",
+  "timeout_sec": 5,
+  "time_sync_threshold_sec": 30,
+  "max_workers": 10,
+  "ib_port": 1,
+  "hosts_file": "/etc/hosts",
+  "management_node": "mgt",
+  "nodes": []
+}
