@@ -23,6 +23,21 @@ func TestParseUptimeDays(t *testing.T) {
 	}
 }
 
+func TestInferIBStatus(t *testing.T) {
+	status, detail := inferIBStatus("State: Active")
+	if status != "PASS" || detail != "Active" {
+		t.Fatalf("unexpected active result: %s %s", status, detail)
+	}
+	status, detail = inferIBStatus("State: Down")
+	if status != "FAIL" || detail != "Down" {
+		t.Fatalf("unexpected down result: %s %s", status, detail)
+	}
+	status, _ = inferIBStatus("State: Init")
+	if status != "WARN" {
+		t.Fatalf("unexpected unknown status: %s", status)
+	}
+}
+
 func TestSummarize(t *testing.T) {
 	nodes := []NodeReport{
 		{Results: []CheckResult{{Status: "PASS"}, {Status: "FAIL"}}},

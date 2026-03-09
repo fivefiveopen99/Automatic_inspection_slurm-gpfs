@@ -31,6 +31,13 @@ type NodeConfig struct {
 }
 
 type Config struct {
+	SSHUser           string       `json:"ssh_user"`
+	SyncUser          string       `json:"sync_user"`
+	TimeoutSec        int          `json:"timeout_sec"`
+	TimeSyncThreshold int          `json:"time_sync_threshold_sec"`
+	MaxWorkers        int          `json:"max_workers"`
+	IBPort            int          `json:"ib_port"`
+	Nodes             []NodeConfig `json:"nodes"`
 	SSHUser             string       `json:"ssh_user"`
 	SyncUser            string       `json:"sync_user"`
 	TimeoutSec          int          `json:"timeout_sec"`
@@ -175,11 +182,20 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 	if sshRes.Status != "PASS" {
 		skipChecks := []string{"运行时长/天", "时间同步状态", "防火墙状态", "SELinux状态", "节点根目录占比", "节点调度状态", "用户同步状态", "IB网络状态", "文件系统挂载状态", "RDMA"}
 		for _, chk := range skipChecks {
+			nr.Results = append(nr.Results, CheckResult{Check: chk, Status: "SKIP", Detail: `\`})
 			nr.Results = append(nr.Results, CheckResult{Check: chk, Status: "SKIP", Detail: "ssh 异常，按规范跳过"})
 		}
 		return nr
 	}
 
+	// 3.1 通用巡检项
+	nr.Results = append(nr.Results, checkUptime(node.Host, user, cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkTimeSync(node.Host, user, cfg.TimeoutSec, cfg.TimeSyncThreshold))
+	nr.Results = append(nr.Results, checkCollect(node.Host, user, "防火墙状态", "systemctl status firewalld.service --no-pager", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkCollect(node.Host, user, "SELinux状态", "getenforce", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkCollect(node.Host, user, "节点根目录占比", "df -h /", cfg.TimeoutSec))
+
+	// 3.2 slurm+gpfs
 	nr.Results = append(nr.Results, checkUptime(node.Host, user, cfg.TimeoutSec))
 	nr.Results = append(nr.Results, checkTimeSync(node.Host, user, cfg.TimeoutSec, cfg.TimeSyncThreshold))
 	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "防火墙状态", "systemctl is-active firewalld.service || true", cfg.TimeoutSec))
@@ -199,6 +215,11 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 		ibPort = cfg.IBPort
 	}
 
+	nr.Results = append(nr.Results, checkCollect(node.Host, user, "节点调度状态", fmt.Sprintf("scontrol show node %s", shellQuote(slurmNode)), cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkUserSync(node.Host, user, syncUser, cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkIBState(node.Host, user, ibPort, cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkCollect(node.Host, user, "文件系统挂载状态", "df -h", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkCollect(node.Host, user, "RDMA", "mmfsadm test verbs status; mmfsadm test verbs conns", cfg.TimeoutSec))
 	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "节点调度状态", fmt.Sprintf("scontrol show node %s", shellQuote(slurmNode)), cfg.TimeoutSec))
 	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "用户同步状态", fmt.Sprintf("id %s", shellQuote(syncUser)), cfg.TimeoutSec))
 	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "IB网络状态", fmt.Sprintf("ibstat %d", ibPort), cfg.TimeoutSec))
@@ -258,12 +279,41 @@ func checkTimeSync(host, user string, timeoutSec, thresholdSec int) CheckResult 
 	return CheckResult{Check: "时间同步状态", Status: "FAIL", Detail: fmt.Sprintf("时间差 %ds (>=%ds)", delta, thresholdSec)}
 }
 
+func checkCollect(host, user, check, cmd string, timeoutSec int) CheckResult {
 func checkSimpleCmd(host, user, check, cmd string, timeoutSec int) CheckResult {
 	rc, out, err := runSSH(host, user, cmd, timeoutSec)
 	if rc == 0 {
 		return CheckResult{Check: check, Status: "PASS", Detail: firstNonEmpty(out, "执行成功")}
 	}
 	return CheckResult{Check: check, Status: "WARN", Detail: firstNonEmpty(err, out, "执行失败")}
+}
+
+func checkUserSync(host, user, syncUser string, timeoutSec int) CheckResult {
+	rc, out, err := runSSH(host, user, fmt.Sprintf("id %s", shellQuote(syncUser)), timeoutSec)
+	if rc == 0 {
+		return CheckResult{Check: "用户同步状态", Status: "PASS", Detail: firstNonEmpty(out, "存在")}
+	}
+	return CheckResult{Check: "用户同步状态", Status: "FAIL", Detail: firstNonEmpty(err, out, "不存在")}
+}
+
+func checkIBState(host, user string, ibPort int, timeoutSec int) CheckResult {
+	rc, out, err := runSSH(host, user, fmt.Sprintf("ibstat %d", ibPort), timeoutSec)
+	if rc != 0 {
+		return CheckResult{Check: "IB网络状态", Status: "WARN", Detail: firstNonEmpty(err, out, "ibstat 执行失败")}
+	}
+	status, detail := inferIBStatus(out)
+	return CheckResult{Check: "IB网络状态", Status: status, Detail: detail}
+}
+
+func inferIBStatus(output string) (string, string) {
+	lower := strings.ToLower(output)
+	if strings.Contains(lower, "state: active") || strings.Contains(lower, " active") {
+		return "PASS", "Active"
+	}
+	if strings.Contains(lower, "state: down") || strings.Contains(lower, " down") {
+		return "FAIL", "Down"
+	}
+	return "WARN", "未识别状态: " + firstNonEmpty(output, "unknown")
 }
 
 func parseUptimeDays(text string) (int, bool) {
@@ -294,6 +344,7 @@ func summarize(nodes []NodeReport) map[string]int {
 	s := map[string]int{"PASS": 0, "FAIL": 0, "WARN": 0, "SKIP": 0}
 	for _, n := range nodes {
 		for _, r := range n.Results {
+			s[r.Status]++
 			s[r.Status] = s[r.Status] + 1
 		}
 	}
@@ -310,6 +361,8 @@ func runLocal(command string, timeoutSec int) (int, string, string) {
 	}
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
+			text := strings.TrimSpace(string(out))
+			return ee.ExitCode(), text, text
 			return ee.ExitCode(), strings.TrimSpace(string(out)), strings.TrimSpace(string(out))
 		}
 		return 1, "", err.Error()
