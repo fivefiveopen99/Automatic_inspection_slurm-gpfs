@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 )
+import "testing"
 
 func TestParseUptimeDays(t *testing.T) {
 	cases := []struct {

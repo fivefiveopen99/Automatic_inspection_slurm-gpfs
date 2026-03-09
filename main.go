@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +43,14 @@ type Config struct {
 	HostsFile         string       `json:"hosts_file"`
 	ManagementNode    string       `json:"management_node"`
 	Nodes             []NodeConfig `json:"nodes"`
+	Nodes             []NodeConfig `json:"nodes"`
+	SSHUser             string       `json:"ssh_user"`
+	SyncUser            string       `json:"sync_user"`
+	TimeoutSec          int          `json:"timeout_sec"`
+	TimeSyncThreshold   int          `json:"time_sync_threshold_sec"`
+	MaxWorkers          int          `json:"max_workers"`
+	IBPort              int          `json:"ib_port"`
+	Nodes               []NodeConfig `json:"nodes"`
 }
 
 type NodeReport struct {
@@ -65,6 +74,9 @@ func main() {
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath, *nodeFile)
+	flag.Parse()
+
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -76,6 +88,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "报告序列化失败: %v\n", err)
 		os.Exit(1)
 	}
+
 	if err := os.WriteFile(*outputPath, data, 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "写入报告失败: %v\n", err)
 		os.Exit(1)
@@ -92,6 +105,12 @@ func main() {
 }
 
 func loadConfig(path, nodeFile string) (Config, error) {
+
+	fmt.Printf("巡检完成，报告输出: %s\n", *outputPath)
+	fmt.Printf("汇总: %+v\n", report.Summary)
+}
+
+func loadConfig(path string) (Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("读取配置失败: %w", err)
@@ -99,6 +118,9 @@ func loadConfig(path, nodeFile string) (Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return Config{}, fmt.Errorf("解析配置失败: %w", err)
+	}
+	if len(cfg.Nodes) == 0 {
+		return Config{}, errors.New("配置中的 nodes 为空")
 	}
 	if cfg.TimeoutSec <= 0 {
 		cfg.TimeoutSec = 5
@@ -212,6 +234,9 @@ func discoverNodesFromHosts(path, managementNode string) ([]NodeConfig, error) {
 	return nodes, nil
 }
 
+	return cfg, nil
+}
+
 func runInspection(cfg Config) Report {
 	report := Report{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
@@ -234,6 +259,7 @@ func runInspection(cfg Config) Report {
 	if workers > len(cfg.Nodes) {
 		workers = len(cfg.Nodes)
 	}
+
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -243,6 +269,7 @@ func runInspection(cfg Config) Report {
 			}
 		}()
 	}
+
 	for _, n := range cfg.Nodes {
 		nodeCh <- n
 	}
@@ -262,6 +289,7 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 	if user == "" {
 		user = cfg.SSHUser
 	}
+
 	nr := NodeReport{Host: node.Host, User: user, Results: []CheckResult{}}
 
 	pingRes := checkPing(node.Host, cfg.TimeoutSec)
@@ -272,6 +300,7 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 		skipChecks := []string{"运行时长/天", "时间同步状态", "防火墙状态", "SELinux状态", "节点根目录占比", "节点调度状态", "用户同步状态", "IB网络状态", "文件系统挂载状态", "RDMA"}
 		for _, chk := range skipChecks {
 			nr.Results = append(nr.Results, CheckResult{Check: chk, Status: "SKIP", Detail: `\`})
+			nr.Results = append(nr.Results, CheckResult{Check: chk, Status: "SKIP", Detail: "ssh 异常，按规范跳过"})
 		}
 		return nr
 	}
@@ -284,6 +313,12 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 	nr.Results = append(nr.Results, checkCollect(node.Host, user, "节点根目录占比", "df -h /", cfg.TimeoutSec))
 
 	// 3.2 slurm+gpfs
+	nr.Results = append(nr.Results, checkUptime(node.Host, user, cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkTimeSync(node.Host, user, cfg.TimeoutSec, cfg.TimeSyncThreshold))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "防火墙状态", "systemctl is-active firewalld.service || true", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "SELinux状态", "getenforce || true", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "节点根目录占比", "df -h /", cfg.TimeoutSec))
+
 	slurmNode := node.SlurmNode
 	if slurmNode == "" {
 		slurmNode = node.Host
@@ -302,6 +337,11 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 	nr.Results = append(nr.Results, checkIBState(node.Host, user, ibPort, cfg.TimeoutSec))
 	nr.Results = append(nr.Results, checkCollect(node.Host, user, "文件系统挂载状态", "df -h", cfg.TimeoutSec))
 	nr.Results = append(nr.Results, checkCollect(node.Host, user, "RDMA", "mmfsadm test verbs status; mmfsadm test verbs conns", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "节点调度状态", fmt.Sprintf("scontrol show node %s", shellQuote(slurmNode)), cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "用户同步状态", fmt.Sprintf("id %s", shellQuote(syncUser)), cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "IB网络状态", fmt.Sprintf("ibstat %d", ibPort), cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "文件系统挂载状态", "df -h", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "RDMA", "mmfsadm test verbs status; mmfsadm test verbs conns", cfg.TimeoutSec))
 
 	return nr
 }
@@ -357,6 +397,7 @@ func checkTimeSync(host, user string, timeoutSec, thresholdSec int) CheckResult 
 }
 
 func checkCollect(host, user, check, cmd string, timeoutSec int) CheckResult {
+func checkSimpleCmd(host, user, check, cmd string, timeoutSec int) CheckResult {
 	rc, out, err := runSSH(host, user, cmd, timeoutSec)
 	if rc == 0 {
 		return CheckResult{Check: check, Status: "PASS", Detail: firstNonEmpty(out, "执行成功")}
@@ -421,6 +462,7 @@ func summarize(nodes []NodeReport) map[string]int {
 	for _, n := range nodes {
 		for _, r := range n.Results {
 			s[r.Status]++
+			s[r.Status] = s[r.Status] + 1
 		}
 	}
 	return s
@@ -680,6 +722,7 @@ func runLocal(command string, timeoutSec int) (int, string, string) {
 		if ee, ok := err.(*exec.ExitError); ok {
 			text := strings.TrimSpace(string(out))
 			return ee.ExitCode(), text, text
+			return ee.ExitCode(), strings.TrimSpace(string(out)), strings.TrimSpace(string(out))
 		}
 		return 1, "", err.Error()
 	}

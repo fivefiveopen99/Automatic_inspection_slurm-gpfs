@@ -8,4 +8,17 @@
   "hosts_file": "/etc/hosts",
   "management_node": "mgt",
   "nodes": []
+  "nodes": [
+    {
+      "host": "10.0.0.11",
+      "user": "root",
+      "slurm_node": "compute001",
+      "sync_user": "testuser",
+      "ib_port": 1
+    },
+    {
+      "host": "10.0.0.12",
+      "slurm_node": "compute002"
+    }
+  ]
 }
