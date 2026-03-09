@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,9 +40,14 @@ type Config struct {
 	TimeSyncThreshold int          `json:"time_sync_threshold_sec"`
 	MaxWorkers        int          `json:"max_workers"`
 	IBPort            int          `json:"ib_port"`
-	HostsFile         string       `json:"hosts_file"`
-	ManagementNode    string       `json:"management_node"`
 	Nodes             []NodeConfig `json:"nodes"`
+	SSHUser             string       `json:"ssh_user"`
+	SyncUser            string       `json:"sync_user"`
+	TimeoutSec          int          `json:"timeout_sec"`
+	TimeSyncThreshold   int          `json:"time_sync_threshold_sec"`
+	MaxWorkers          int          `json:"max_workers"`
+	IBPort              int          `json:"ib_port"`
+	Nodes               []NodeConfig `json:"nodes"`
 }
 
 type NodeReport struct {
@@ -60,11 +66,9 @@ type Report struct {
 func main() {
 	configPath := flag.String("config", "inspection_config.example.json", "配置文件路径")
 	outputPath := flag.String("output", "inspection_report.json", "输出报告 JSON 文件")
-	tablePath := flag.String("o", "inspection_report.txt", "输出文本表格报告文件（名称和路径）")
-	nodeFile := flag.String("f", "", "节点文件路径（每行一个节点，# 开头为注释）")
 	flag.Parse()
 
-	cfg, err := loadConfig(*configPath, *nodeFile)
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -76,22 +80,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "报告序列化失败: %v\n", err)
 		os.Exit(1)
 	}
+
 	if err := os.WriteFile(*outputPath, data, 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "写入报告失败: %v\n", err)
 		os.Exit(1)
 	}
-	tableName := filepath.Base(*tablePath)
-	if err := os.WriteFile(*tablePath, []byte(renderTableReport(report, tableName)), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "写入表格报告失败: %v\n", err)
-		os.Exit(1)
-	}
 
-	fmt.Printf("巡检完成，JSON报告: %s\n", *outputPath)
-	fmt.Printf("巡检完成，表格报告: %s\n", *tablePath)
+	fmt.Printf("巡检完成，报告输出: %s\n", *outputPath)
 	fmt.Printf("汇总: %+v\n", report.Summary)
 }
 
-func loadConfig(path, nodeFile string) (Config, error) {
+func loadConfig(path string) (Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("读取配置失败: %w", err)
@@ -99,6 +98,9 @@ func loadConfig(path, nodeFile string) (Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return Config{}, fmt.Errorf("解析配置失败: %w", err)
+	}
+	if len(cfg.Nodes) == 0 {
+		return Config{}, errors.New("配置中的 nodes 为空")
 	}
 	if cfg.TimeoutSec <= 0 {
 		cfg.TimeoutSec = 5
@@ -212,6 +214,9 @@ func discoverNodesFromHosts(path, managementNode string) ([]NodeConfig, error) {
 	return nodes, nil
 }
 
+	return cfg, nil
+}
+
 func runInspection(cfg Config) Report {
 	report := Report{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
@@ -234,6 +239,7 @@ func runInspection(cfg Config) Report {
 	if workers > len(cfg.Nodes) {
 		workers = len(cfg.Nodes)
 	}
+
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -243,6 +249,7 @@ func runInspection(cfg Config) Report {
 			}
 		}()
 	}
+
 	for _, n := range cfg.Nodes {
 		nodeCh <- n
 	}
@@ -262,6 +269,7 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 	if user == "" {
 		user = cfg.SSHUser
 	}
+
 	nr := NodeReport{Host: node.Host, User: user, Results: []CheckResult{}}
 
 	pingRes := checkPing(node.Host, cfg.TimeoutSec)
@@ -272,6 +280,7 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 		skipChecks := []string{"运行时长/天", "时间同步状态", "防火墙状态", "SELinux状态", "节点根目录占比", "节点调度状态", "用户同步状态", "IB网络状态", "文件系统挂载状态", "RDMA"}
 		for _, chk := range skipChecks {
 			nr.Results = append(nr.Results, CheckResult{Check: chk, Status: "SKIP", Detail: `\`})
+			nr.Results = append(nr.Results, CheckResult{Check: chk, Status: "SKIP", Detail: "ssh 异常，按规范跳过"})
 		}
 		return nr
 	}
@@ -284,6 +293,12 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 	nr.Results = append(nr.Results, checkCollect(node.Host, user, "节点根目录占比", "df -h /", cfg.TimeoutSec))
 
 	// 3.2 slurm+gpfs
+	nr.Results = append(nr.Results, checkUptime(node.Host, user, cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkTimeSync(node.Host, user, cfg.TimeoutSec, cfg.TimeSyncThreshold))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "防火墙状态", "systemctl is-active firewalld.service || true", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "SELinux状态", "getenforce || true", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "节点根目录占比", "df -h /", cfg.TimeoutSec))
+
 	slurmNode := node.SlurmNode
 	if slurmNode == "" {
 		slurmNode = node.Host
@@ -302,6 +317,11 @@ func inspectNode(cfg Config, node NodeConfig) NodeReport {
 	nr.Results = append(nr.Results, checkIBState(node.Host, user, ibPort, cfg.TimeoutSec))
 	nr.Results = append(nr.Results, checkCollect(node.Host, user, "文件系统挂载状态", "df -h", cfg.TimeoutSec))
 	nr.Results = append(nr.Results, checkCollect(node.Host, user, "RDMA", "mmfsadm test verbs status; mmfsadm test verbs conns", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "节点调度状态", fmt.Sprintf("scontrol show node %s", shellQuote(slurmNode)), cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "用户同步状态", fmt.Sprintf("id %s", shellQuote(syncUser)), cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "IB网络状态", fmt.Sprintf("ibstat %d", ibPort), cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "文件系统挂载状态", "df -h", cfg.TimeoutSec))
+	nr.Results = append(nr.Results, checkSimpleCmd(node.Host, user, "RDMA", "mmfsadm test verbs status; mmfsadm test verbs conns", cfg.TimeoutSec))
 
 	return nr
 }
@@ -357,6 +377,7 @@ func checkTimeSync(host, user string, timeoutSec, thresholdSec int) CheckResult 
 }
 
 func checkCollect(host, user, check, cmd string, timeoutSec int) CheckResult {
+func checkSimpleCmd(host, user, check, cmd string, timeoutSec int) CheckResult {
 	rc, out, err := runSSH(host, user, cmd, timeoutSec)
 	if rc == 0 {
 		return CheckResult{Check: check, Status: "PASS", Detail: firstNonEmpty(out, "执行成功")}
@@ -421,251 +442,10 @@ func summarize(nodes []NodeReport) map[string]int {
 	for _, n := range nodes {
 		for _, r := range n.Results {
 			s[r.Status]++
+			s[r.Status] = s[r.Status] + 1
 		}
 	}
 	return s
-}
-
-func renderTableReport(report Report, title string) string {
-	headers := []string{"Addr", "SSH", "外网连通性", "运行时长", "时间同步", "防火墙状态", "SELinux状态", "根目录占用情况", "节点调度状态", "用户同步状态", "IB状态", "文件系统挂载状态", "RDMA状态"}
-	rows := make([][]string, 0, len(report.Nodes))
-	for _, n := range report.Nodes {
-		rows = append(rows, formatNodeRow(n))
-	}
-	return renderBorderTable(title, headers, rows)
-}
-
-func formatNodeRow(node NodeReport) []string {
-	get := func(name string) CheckResult {
-		for _, r := range node.Results {
-			if r.Check == name {
-				return r
-			}
-		}
-		return CheckResult{Status: "WARN", Detail: "N/A"}
-	}
-	sshRes := get("ssh连通(ssh)")
-	pingRes := get("ssh连通(ping)")
-	uptimeRes := get("运行时长/天")
-	timeRes := get("时间同步状态")
-	fwRes := get("防火墙状态")
-	selRes := get("SELinux状态")
-	rootRes := get("节点根目录占比")
-	slurmRes := get("节点调度状态")
-	userRes := get("用户同步状态")
-	ibRes := get("IB网络状态")
-	fsRes := get("文件系统挂载状态")
-	rdmaRes := get("RDMA")
-
-	return []string{
-		node.Host,
-		statusText(sshRes, "Active", "Down", "Unknown"),
-		statusText(pingRes, "连通", "断开", "未知"),
-		formatUptime(uptimeRes),
-		statusText(timeRes, "同步", "不同步", "未知"),
-		formatFirewall(fwRes),
-		formatSELinux(selRes),
-		formatRootUsage(rootRes),
-		formatSlurmState(slurmRes),
-		statusText(userRes, "同步", "不同步", "未知"),
-		formatIB(ibRes),
-		statusText(fsRes, "正常", "异常", "未知"),
-		formatRDMA(rdmaRes),
-	}
-}
-
-func statusText(r CheckResult, pass, fail, other string) string {
-	if r.Status == "SKIP" {
-		return `\`
-	}
-	switch r.Status {
-	case "PASS":
-		return pass
-	case "FAIL":
-		return fail
-	default:
-		return other
-	}
-}
-
-func formatUptime(r CheckResult) string {
-	if r.Status == "SKIP" {
-		return `\`
-	}
-	re := regexp.MustCompile(`(\d+)`)
-	m := re.FindStringSubmatch(r.Detail)
-	if len(m) > 1 {
-		return m[1] + " 天"
-	}
-	return "未知"
-}
-
-func formatFirewall(r CheckResult) string {
-	if r.Status == "SKIP" {
-		return `\`
-	}
-	lower := strings.ToLower(r.Detail)
-	if strings.Contains(lower, "active: active") || strings.Contains(lower, "running") {
-		return "active"
-	}
-	if strings.Contains(lower, "active: inactive") || strings.Contains(lower, "dead") {
-		return "inactive"
-	}
-	if strings.Contains(lower, "inactive") {
-		return "inactive"
-	}
-	return firstLine(r.Detail)
-}
-
-func formatSELinux(r CheckResult) string {
-	if r.Status == "SKIP" {
-		return `\`
-	}
-	line := firstLine(r.Detail)
-	if line == "" {
-		return "未知"
-	}
-	return line
-}
-
-func formatRootUsage(r CheckResult) string {
-	if r.Status == "SKIP" {
-		return `\`
-	}
-	for _, line := range strings.Split(r.Detail, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 5 && (strings.HasPrefix(fields[0], "/dev/") || fields[0] == "overlay") {
-			return fmt.Sprintf("U %s, F %s", fields[4], fields[3])
-		}
-	}
-	return "未知"
-}
-
-func formatSlurmState(r CheckResult) string {
-	if r.Status == "SKIP" {
-		return `\`
-	}
-	for _, field := range strings.Fields(r.Detail) {
-		if strings.HasPrefix(field, "State=") {
-			state := strings.TrimPrefix(field, "State=")
-			if i := strings.Index(state, "+"); i > 0 {
-				state = state[:i]
-			}
-			return state
-		}
-	}
-	return firstLine(r.Detail)
-}
-
-func formatIB(r CheckResult) string {
-	if r.Status == "SKIP" {
-		return `\`
-	}
-	if strings.EqualFold(strings.TrimSpace(r.Detail), "Active") {
-		return "Active"
-	}
-	if strings.EqualFold(strings.TrimSpace(r.Detail), "Down") {
-		return "Down"
-	}
-	return statusText(r, "Active", "Down", "未知")
-}
-
-func formatRDMA(r CheckResult) string {
-	if r.Status == "SKIP" {
-		return `\`
-	}
-	lower := strings.ToLower(r.Detail)
-	if strings.Contains(lower, "started") {
-		return "started"
-	}
-	if strings.Contains(lower, "down") {
-		return "down"
-	}
-	return firstLine(r.Detail)
-}
-
-func renderBorderTable(title string, headers []string, rows [][]string) string {
-	widths := make([]int, len(headers))
-	for i, h := range headers {
-		widths[i] = runeLen(h)
-	}
-	for _, row := range rows {
-		for i, v := range row {
-			if runeLen(v) > widths[i] {
-				widths[i] = runeLen(v)
-			}
-		}
-	}
-	for i := range widths {
-		widths[i] += 2
-	}
-	var b strings.Builder
-	line := func(ch string) {
-		b.WriteString("+")
-		for _, w := range widths {
-			b.WriteString(strings.Repeat(ch, w))
-			b.WriteString("+")
-		}
-		b.WriteString("\n")
-	}
-	line("-")
-	total := 1
-	for _, w := range widths {
-		total += w + 1
-	}
-	b.WriteString("|" + padCenter(title, total-2) + "|\n")
-	line("-")
-	b.WriteString(renderTableRow(headers, widths))
-	line("-")
-	for _, r := range rows {
-		b.WriteString(renderTableRow(r, widths))
-	}
-	line("-")
-	return b.String()
-}
-
-func renderTableRow(values []string, widths []int) string {
-	var b strings.Builder
-	b.WriteString("|")
-	for i, v := range values {
-		b.WriteString(padRight(v, widths[i]))
-		b.WriteString("|")
-	}
-	b.WriteString("\n")
-	return b.String()
-}
-
-func firstLine(s string) string {
-	parts := strings.Split(strings.TrimSpace(s), "\n")
-	if len(parts) == 0 {
-		return ""
-	}
-	return strings.TrimSpace(parts[0])
-}
-
-func padRight(s string, width int) string {
-	space := width - runeLen(s)
-	if space < 0 {
-		space = 0
-	}
-	if space <= 1 {
-		return " " + s
-	}
-	return " " + s + strings.Repeat(" ", space-1)
-}
-
-func padCenter(s string, width int) string {
-	if width <= runeLen(s) {
-		return s
-	}
-	total := width - runeLen(s)
-	left := total / 2
-	right := total - left
-	return strings.Repeat(" ", left) + s + strings.Repeat(" ", right)
-}
-
-func runeLen(s string) int {
-	return len([]rune(s))
 }
 
 func runLocal(command string, timeoutSec int) (int, string, string) {
@@ -680,6 +460,7 @@ func runLocal(command string, timeoutSec int) (int, string, string) {
 		if ee, ok := err.(*exec.ExitError); ok {
 			text := strings.TrimSpace(string(out))
 			return ee.ExitCode(), text, text
+			return ee.ExitCode(), strings.TrimSpace(string(out)), strings.TrimSpace(string(out))
 		}
 		return 1, "", err.Error()
 	}
