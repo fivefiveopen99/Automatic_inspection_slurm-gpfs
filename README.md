@@ -65,6 +65,18 @@ go run . --config inspection_config.json -f nodes.txt --output inspection_report
 - 参数：`-f <节点文件路径>`。
 - 文件格式：每行一个节点名（如 `io1`），空行和 `#` 注释行会忽略。
 - 优先级：`-f` > 配置 `nodes` > `/etc/hosts` 自动发现。
+
+
+## 持续集成（防止克隆后编译失败）
+
+- 仓库已启用 GitHub Actions：每次 push / PR 自动执行 `go test ./...` 与 `go build -o hpc-inspector .`。
+- 如果你本地 clone 后仍报语法错误，优先确认是否拉到了最新提交：
+
+```bash
+git pull --rebase
+go test ./...
+go build -o hpc-inspector .
+```
 # 修改 nodes、用户名、端口等
 
 go run . --config inspection_config.json --output inspection_report.json
