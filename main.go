@@ -9,6 +9,9 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"regexp"
 	"strconv"
 	"strings"
@@ -117,6 +120,100 @@ func loadConfig(path string) (Config, error) {
 	if cfg.SyncUser == "" {
 		cfg.SyncUser = "root"
 	}
+	if cfg.HostsFile == "" {
+		cfg.HostsFile = "/etc/hosts"
+	}
+	if cfg.ManagementNode == "" {
+		cfg.ManagementNode = "mgt"
+	}
+	if strings.TrimSpace(nodeFile) != "" {
+		nodes, err := loadNodesFromFile(nodeFile)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Nodes = nodes
+	}
+	if len(cfg.Nodes) == 0 {
+		nodes, err := discoverNodesFromHosts(cfg.HostsFile, cfg.ManagementNode)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Nodes = nodes
+	}
+	return cfg, nil
+}
+
+func loadNodesFromFile(path string) ([]NodeConfig, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取节点文件失败: %w", err)
+	}
+	seen := map[string]struct{}{}
+	nodes := make([]NodeConfig, 0)
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		host := fields[0]
+		lowerHost := strings.ToLower(host)
+		if lowerHost == "localhost" || strings.HasPrefix(lowerHost, "localhost.") {
+			continue
+		}
+		if _, ok := seen[lowerHost]; ok {
+			continue
+		}
+		seen[lowerHost] = struct{}{}
+		nodes = append(nodes, NodeConfig{Host: host, SlurmNode: host})
+	}
+	if len(nodes) == 0 {
+		return nil, errors.New("节点文件中未读取到有效节点")
+	}
+	return nodes, nil
+}
+
+func discoverNodesFromHosts(path, managementNode string) ([]NodeConfig, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取 hosts 文件失败: %w", err)
+	}
+	mgmt := strings.ToLower(managementNode)
+	seen := map[string]struct{}{}
+	nodes := make([]NodeConfig, 0)
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		for _, host := range fields[1:] {
+			if strings.HasPrefix(host, "#") {
+				break
+			}
+			lowerHost := strings.ToLower(host)
+			if lowerHost == "localhost" || strings.HasPrefix(lowerHost, "localhost.") || lowerHost == mgmt {
+				continue
+			}
+			if _, ok := seen[lowerHost]; ok {
+				continue
+			}
+			seen[lowerHost] = struct{}{}
+			nodes = append(nodes, NodeConfig{Host: host, SlurmNode: host})
+		}
+	}
+	if len(nodes) == 0 {
+		return nil, errors.New("配置中的 nodes 为空，且未能从 hosts 自动发现普通节点")
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Host < nodes[j].Host
+	})
+	return nodes, nil
+}
+
 	return cfg, nil
 }
 

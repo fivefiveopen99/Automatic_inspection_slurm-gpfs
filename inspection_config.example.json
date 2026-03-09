@@ -5,6 +5,9 @@
   "time_sync_threshold_sec": 30,
   "max_workers": 10,
   "ib_port": 1,
+  "hosts_file": "/etc/hosts",
+  "management_node": "mgt",
+  "nodes": []
   "nodes": [
     {
       "host": "10.0.0.11",
